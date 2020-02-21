@@ -1,83 +1,98 @@
 import { Server } from 'socket.io';
-import { ServerBase } from '../ServerBase';
+
+import { ServerBase } from '../base/ServerBase';
+
 import { IHubDecoratorOptions, hubDecoratorKey } from './HubDecorator';
-
-interface IHubMessage {
-    service: string;
-    event: string;
-    data: any;
-}
-
-interface IHubRequest extends IHubMessage {
-    method: string;
-    credentials: any;
-}
-
-interface IHubResponse extends IHubMessage {
-    method: string;
-    isSuccess: boolean;
-    error?: string;
-}
-
-interface IHubEventDescription {
-    options: IHubDecoratorOptions;
-    clients: Array<{
-        socket: SocketIO.Socket;
-        credentials: string;
-    }>;
-}
+import { IHubRequest } from './messages/IHubRequest';
+import { IHubResponse } from './messages/IHubResponse';
+import { IHubMessage } from './messages/IHubMessage';
+import { HubServiceCollection } from './types/HubServiceCollection';
+import { WSErrorCode } from '../base/WSErrorCode';
+import { IWSError } from '../base/IWSError';
 
 export class HubServer extends ServerBase {
 
-    private requestEvent = '__hub::request__';
-    private responseEvent = '__hub::response__';
-    private publishEvent = '__hub::publish__';
+    //#region [ constants ]
+    private REQUEST_EVENT = '__hub::request__';
+    private RESPONSE_EVENT = '__hub::response__';
+    private PUBLISH_EVENT = '__hub::publish__';
+    //#endregion
 
-    private _services: {
-        [service: string]: {
-            [event: string]: IHubEventDescription,
-        },
-    } = {};
+    private _services = new HubServiceCollection();
 
-    protected onInitialize(server: Server, jwtDecoder: (token: string) => any): void {
+    //#region  [ implement ServerBase ]
+    protected onInitialize(server: Server): void {
         server.on('connection', client => {
             client
-                .on(this.requestEvent, async (request: IHubRequest) => {
-                    switch (request.method) {
-                        case 'subscribe': await this.subscribe(client, request); break;
-                        case 'unsubscribe': this.unusbscribe(client, request); break;
-                        default: this.respondError(client, request, `method '${request.method}' not implemented.`);
+                .on(this.REQUEST_EVENT, async (req: IHubRequest) => {
+                    try {
+                        switch (req.method) {
+                            case 'subscribe': await this.subscribe(client, req); break;
+                            case 'unsubscribe': this.unusbscribe(client, req); break;
+                            default: this.respondError(client, req, {
+                                code: WSErrorCode.ws_error,
+                                message: `method '${req.method}' not implemented.`,
+                            });
+                        }
+                    } catch (err) {
+                        this.respondError(client, req, {
+                            code: WSErrorCode.ws_error,
+                            message: `method '${req.method}': ${err.message}`,
+                        });
                     }
                 })
                 .on('disconnect', () => this.removeClient(client));
         });
     }
 
-    public register(instance: object): void {
-        this.log(`register class ${instance.constructor.name}`);
+    public register(instance: any): void {
+        this.logger.log(`register class ${instance.constructor.name}`);
         this.getEventDispatcherProperties(instance).forEach(propertyKey => {
-            const metadata: IHubDecoratorOptions = Reflect.getMetadata(hubDecoratorKey, instance, propertyKey);
-            if (metadata) {
-                const service = metadata.service;
+            const options: IHubDecoratorOptions = Reflect.getMetadata(hubDecoratorKey, instance, propertyKey);
+            if (options) {
+                const service = options.service
+                    ? options.service
+                    : this.extractServiceNameFromInstance(instance);
                 const event = propertyKey;
 
-                if (!this._services[service]) {
-                    this._services[service] = {};
-                }
-                if (this._services[service][event]) {
+                if (this._services.exists(service, event)) {
                     throw new Error(`service '${service}' already contains event '${event}'`);
                 }
-                this._services[service][event] = {
-                    options: metadata,
-                    clients: [],
-                };
-                instance[event].sub(async (serverCredentials, data) => {
-                    this.log(`${instance.constructor.name}.${event} dispatched`);
-                    await this.publish(service, event, data, serverCredentials);
-                });
+                this._services.add({ service, event, instance, options, clients: [] });
+
+                switch (instance[event]._type) {
+                    case 'HubEvent':
+                        instance[event].on(async () => {
+                            this.logger.log(`${instance.constructor.name}.${event} dispatched`);
+                            await this.publish(service, event, null, null);
+                        });
+                        break;
+                    case 'HubEventCredentials':
+                        instance[event].on(async (credentials: any) => {
+                            this.logger.log(`${instance.constructor.name}.${event} dispatched`);
+                            await this.publish(service, event, null, credentials);
+                        });
+                        break;
+                    case 'HubEventData':
+                        instance[event].on(async (data: any) => {
+                            this.logger.log(`${instance.constructor.name}.${event} dispatched`);
+                            await this.publish(service, event, data, null);
+                        });
+                        break;
+                    case 'HubEventCredentialsData':
+                        instance[event].on(async (credentials: any, data: any) => {
+                            this.logger.log(`${instance.constructor.name}.${event} dispatched`);
+                            await this.publish(service, event, data, credentials);
+                        });
+                        break;
+                }
             }
         });
     }
+    registerMany(instances: any[]) {
+        instances.forEach(instance => this.register(instance));
+    }
+    //#endregion
 
     //#region [ reflection ]
     private getEventDispatcherProperties(instance: any): string[] {
@@ -88,127 +103,131 @@ export class HubServer extends ServerBase {
             current = Object.getPrototypeOf(current);
         } while (current);
 
-        return props.sort().filter((name) => instance[name].constructor && instance[name].constructor.name == 'EventDispatcher');
+        return props.sort().filter((name) => instance[name].constructor && instance[name]._type && (
+            instance[name]._type == 'HubEvent' ||
+            instance[name]._type == 'HubEventData' ||
+            instance[name]._type == 'HubEventCredentials' ||
+            instance[name]._type == 'HubEventCredentialsData'
+        ));
     }
     //#endregion
 
     //#region [ message helpers ]
-    private respondError(client: SocketIO.Socket, request: IHubRequest, message: string) {
-        client.emit(this.responseEvent, {
-            method: request.method,
-            service: request.service,
-            event: request.event,
+    private respondError(client: SocketIO.Socket, req: IHubRequest, error: IWSError) {
+        client.emit(this.RESPONSE_EVENT, {
+            method: req.method,
+            service: req.service,
+            eventName: req.eventName,
             isSuccess: false,
-            error: message,
+            error,
         } as IHubResponse);
-        this.error(message);
+        this.logger.error(JSON.stringify(error));
     }
-    private respondSuccess(client: SocketIO.Socket, request: IHubRequest, data?: any) {
-        client.emit(this.responseEvent, {
-            method: request.method,
-            service: request.service,
-            event: request.event,
+    private respondSuccess(client: SocketIO.Socket, req: IHubRequest, data?: any) {
+        client.emit(this.RESPONSE_EVENT, {
+            method: req.method,
+            service: req.service,
+            eventName: req.eventName,
             isSuccess: true,
             data,
         } as IHubResponse);
-        this.log('success');
+        this.logger.log('success');
     }
     //#endregion
 
     //#region  [ private ]
-    private async subscribe(client: SocketIO.Socket, request: IHubRequest) {
-        if (!this._services[request.service]) {
+    private async subscribe(client: SocketIO.Socket, req: IHubRequest) {
+        if (!this._services.exists(req.service, req.eventName)) {
             this.respondError(
                 client,
-                request,
-                `service '${request.service}' not found.`,
-            );
-        } else if (!this._services[request.service][request.event]) {
-            this.respondError(
-                client,
-                request,
-                `service '${request.service}' not contains event '${request.event}'.`,
+                req,
+                {
+                    code: WSErrorCode.ws_error,
+                    message: `service '${req.service}' or event '${req.eventName} not found.`,
+                },
             );
         } else {
-            const isValid = await this.isOptionsValid(client, this._services[request.service][request.event].options, request.credentials);
-            if (!isValid) {
+            const descriptor = this._services.get(req.service, req.eventName);
+            const code = await this.isValid(
+                client,
+                descriptor.instance,
+                descriptor.options,
+                req.credentials,
+            );
+            if (code != WSErrorCode.none) {
                 this.respondError(
                     client,
-                    request,
-                    `unauthorized`,
+                    req,
+                    {
+                        code,
+                        message: `unauthorized`,
+                    },
                 );
             } else {
-                const clients = this._services[request.service][request.event].clients;
+                const clients = descriptor.clients;
                 if (!clients.find(x => x.socket.id == client.id)) {
                     clients.push({
                         socket: client,
-                        credentials: request.credentials,
+                        credentials: req.credentials,
                     });
                 }
-                this.respondSuccess(client, request);
+                this.respondSuccess(client, req);
             }
         }
     }
-    private unusbscribe(client: SocketIO.Socket, request: IHubRequest) {
-        if (!this._services[request.service]) {
+    private unusbscribe(client: SocketIO.Socket, req: IHubRequest) {
+        if (!this._services.exists(req.service, req.eventName)) {
             this.respondError(
                 client,
-                request,
-                `service '${request.service}' not found.`,
-            );
-        } else if (!this._services[request.service][request.event]) {
-            this.respondError(
-                client,
-                request,
-                `service '${request.service}' not contains event '${request.event}'.`,
+                req,
+                {
+                    code: WSErrorCode.ws_error,
+                    message: `service '${req.service}' or event '${req.eventName} not found.`,
+                },
             );
         } else {
-            const clients = this._services[request.service][request.event].clients;
+            const descriptor = this._services.get(req.service, req.eventName);
+            const clients = descriptor.clients;
             const idx = clients.findIndex(x => x.socket.id == client.id);
             if (idx > -1) {
                 clients.splice(idx, 1);
             }
-            this.respondSuccess(client, request);
+            this.respondSuccess(client, req);
         }
     }
     private async publish(service: string, event: string, data: any, serverCredentials: any) {
-        const selection = this._services[service][event].options.selection;
-        const clients = this._services[service][event].clients;
+        const descriptor = this._services.get(service, event);
+        const selection = descriptor.options.selection;
+        const clients = descriptor.clients;
         const selectedClients: SocketIO.Socket[] = [];
 
         for (const client of clients) {
-            const user = (client as any).user;
+            const user = (client as any).socket.user;
             const userCredentials = (client as any).credentials;
 
             if (!selection) {
                 selectedClients.push(client.socket);
             } else {
-                const isValid = await selection(user, userCredentials, serverCredentials);
+                const isValid = await selection(descriptor.instance, user, userCredentials, serverCredentials);
                 if (isValid) {
                     selectedClients.push(client.socket);
                 }
             }
         }
-        selectedClients.forEach(x => x.emit(this.publishEvent, {
+        selectedClients.forEach(x => x.emit(this.PUBLISH_EVENT, {
             service,
-            event,
+            eventName: event,
             data,
         } as IHubMessage));
     }
     private removeClient(client: SocketIO.Socket) {
-        for (const service in this._services) {
-            if (service) {
-                for (const event in this._services[service]) {
-                    if (event) {
-                        const clients = this._services[service][event].clients;
-                        const idx = clients.findIndex(x => x.socket.id == client.id);
-                        if (idx > -1) {
-                            clients.splice(idx, 1);
-                        }
-                    }
-                }
+        this._services.list().forEach(descriptor => {
+            const clients = descriptor.clients;
+            const idx = clients.findIndex(x => x.socket.id == client.id);
+            if (idx > -1) {
+                descriptor.clients = clients.splice(idx, 1);
             }
-        }
+        });
     }
     //#endregion
 }

@@ -1,9 +1,4 @@
-
-export interface IParamDecorator {
-    type: string;
-    name: string;
-    idx: number;
-}
+import { IParamDecorator } from '../../decorators/IParamDecorator';
 
 export const paramDecoratorKey = 'custom:param';
 

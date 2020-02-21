@@ -1,29 +1,32 @@
 import { Server } from 'socket.io';
 import { IDecoratorOptionsBase } from './IDecoratorOptionsBase';
-import { IParamDecorator, paramDecoratorKey } from './ParamDecorators';
-import { IMethodMetadata } from './IMetadata';
-import { Logger } from './Logger';
+import { paramDecoratorKey } from '../rest/decorators/ParamDecorators';
+import { Logger } from '../types/Logger';
+import { IParamDecorator } from '../decorators/IParamDecorator';
+import { IMethodMetadata } from '../decorators/IMethodMetadata';
+import { IWSError } from './IWSError';
+import { WSErrorCode } from './WSErrorCode';
 
 export abstract class ServerBase {
 
     //#region [ abstract ]
-    protected abstract onInitialize(server: Server, jwtDecoder: (token: string) => any): void;
-    public abstract register(instance: object): void;
+    protected abstract onInitialize(server: Server): void;
+    public abstract register(instance: any): void;
+    public abstract registerMany(instances: any[]): void;
     //#endregion
 
     //#region [ fields ]
     protected _server: Server;
-    protected _logger: Logger;
     protected _jwtDecoder: (token: string) => any;
     //#endregion
 
     //#region [ properties ]
-    public debug = true;
+    public logger: Logger;
     //#endregion
 
     //#region [ constructor ]
     constructor() {
-        this._logger = new Logger(this.constructor.name);
+        this.logger = new Logger(this.constructor.name);
     }
     //#endregion
 
@@ -33,56 +36,60 @@ export abstract class ServerBase {
      * @param {(token: string) => any} jwtDecoder - return user from jwt token
      */
     public initialize(server: Server, jwtDecoder: (token: string) => any) {
+        this.logger.log('initialize');
+
         this._server = server;
         this._jwtDecoder = jwtDecoder;
-        this.log('initialize');
-        this.onInitialize(server, jwtDecoder);
+
+        this.onInitialize(server);
     }
     //#endregion
 
     //#region [ validation ]
-    protected async isOptionsValid(client: SocketIO.Socket, options: IDecoratorOptionsBase, credentials: any): Promise<boolean> {
+    protected async isValid(
+        client: SocketIO.Socket,
+        instance: any,
+        options: IDecoratorOptionsBase,
+        credentials: any,
+    ): Promise<WSErrorCode> {
         if (options.isAuth) {
-            if (!client.handshake.query.auth_token) { return false; }
+            if (!client.handshake.query.auth_token) { return WSErrorCode.auth_required; }
             try {
                 const user = await this._jwtDecoder(client.handshake.query.auth_token);
                 (client as any).user = user;
             } catch (err) {
-                this.error('isAuth: ' + err.message, err);
-                return false;
+                this.logger.error('isAuth: ' + err.message, err);
+                return WSErrorCode.auth_token_error;
             }
             if (options.roles) {
                 const user = (client as any).user;
-                const hasRole = (u: any) => {
-                    return u.roles.some(userRole => {
-                        return options.roles.indexOf(userRole) != -1;
-                    });
-                };
-                if (!hasRole(user)) {
-                    this.error('invalid user roles');
-                    return false;
+                if (!user.roles) { return WSErrorCode.auth_invalid_role; }
+                if (!Array.isArray(user.roles)) { return WSErrorCode.auth_invalid_role; }
+                if (!user.roles.some((role: string) => options.roles.indexOf(role) != -1)) {
+                    this.logger.error('invalid user roles');
+                    return WSErrorCode.auth_invalid_role;
                 }
             }
         }
         if (options.validation) {
             try {
-                const isValid = await options.validation((client as any).user, credentials);
-                if (!isValid) { return false; }
+                const isValid = await options.validation(instance, (client as any).user, credentials);
+                if (!isValid) { return WSErrorCode.auth_credentials_error; }
             } catch (err) {
-                this.error('validation: ' + err.message, err);
-                return false;
+                this.logger.error('validation: ' + err.message, err);
+                return WSErrorCode.auth_credentials_error;
             }
         }
-        return true;
+        return WSErrorCode.none;
     }
     //#endregion
 
     //#region [ reflection ]
-    protected isPromise(value: any) {
+    protected isPromise(value: any): boolean {
         if (!value) { return false; }
         return typeof value.then == 'function';
     }
-    protected getMethods(instance: object) {
+    protected getMethods(instance: any): string[] {
         let props: string[] = [];
         let current = instance;
         do {
@@ -92,7 +99,7 @@ export abstract class ServerBase {
 
         return props.sort().filter((name, idx, arr) => name != arr[idx + 1] && typeof instance[name] == 'function');
     }
-    protected getMethodsParamNames(fn) {
+    protected getMethodsParamNames(fn: any): string[] {
         const COMMENTS = /((\/\/.*$)|(\/\*[\s\S]*?\*\/))/mg;
         const DEFAULT_PARAMS = /=[^,]+/mg;
         const FAT_ARROWS = /=>.*$/mg;
@@ -109,7 +116,7 @@ export abstract class ServerBase {
             ? []
             : result;
     }
-    protected hasParamDecorators(target: any, propertyName: string) {
+    protected hasParamDecorators(target: any, propertyName: string): boolean {
         const metadata = Reflect.getMetadata(paramDecoratorKey, target, propertyName);
         return metadata ? true : false;
     }
@@ -134,24 +141,14 @@ export abstract class ServerBase {
         };
 
     }
-    //#endregion
-
-    //#region [ log ]
-    protected log(msg: string, data?: any) {
-        if (this.debug) {
-            this._logger.log(msg);
-            if (data) {
-                console.log(data);
-            }
+    protected extractServiceNameFromInstance(instance: any): string {
+        if (!instance.service) {
+            throw new Error('object doesn\'t contains service:strin property. define service in decorator.');
         }
-    }
-    protected error(msg: string, data?: any) {
-        if (this.debug) {
-            this._logger.error(msg);
-            if (data) {
-                console.log(data);
-            }
+        if (typeof instance.service != 'string') {
+            throw new Error('service property must be string');
         }
+        return instance.service;
     }
     //#endregion
 }

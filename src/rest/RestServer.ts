@@ -1,73 +1,67 @@
 import 'reflect-metadata';
 import { Server } from 'socket.io';
 
-import { RestDecoratorOptions, restDecoratorKey } from './RestDecorator';
-import { ServerBase } from '../ServerBase';
-import { IDecoratorOptionsBase } from '../IDecoratorOptionsBase';
-import { IMethodMetadata, IParamMetadata } from '../IMetadata';
+import { ServerBase } from '../base/ServerBase';
+import { IParamMetadata } from '../decorators/IParamMetadata';
 
-interface IRestMessage {
-    service: string;
-    method: string;
-    data?: any;
-}
-
-interface IRestRequest extends IRestMessage {
-    credentials: any;
-}
-
-interface IRestResponse extends IRestMessage {
-    isSuccess: boolean;
-    error?: string;
-}
-
-interface IRestMethodDescription {
-    metadata: IMethodMetadata;
-    options: IDecoratorOptionsBase;
-}
+import { RestDecoratorOptions, restDecoratorKey } from './decorators/RestDecorator';
+import { IRestRequest } from './messages/IRestRequest';
+import { IRestResponse } from './messages/IRestResponse';
+import { RestServiceCollection } from './types/RestServiceCollection';
+import { WSErrorCode } from '../base/WSErrorCode';
+import { IWSError } from '../base/IWSError';
 
 export class RestServer extends ServerBase {
-    //#region [ fields ]
-    private requestEvent = '__rest::request__';
-    private requestResponse = '__rest::response__';
 
-    private _services: {
-        [service: string]: {
-            [method: string]: IRestMethodDescription,
-        },
-    } = {};
+    //#region [ constants ]
+    private REQUEST_EVENT = '__rest::request__';
+    private RESPONSE_EVENT = '__rest::response__';
+    //#endregion
+
+    //#region [ fields ]
+    private _services = new RestServiceCollection();
 
     //#region [ ServerBase ]
-    protected onInitialize(server: Server, jwtDecoder: (token: string) => any) {
+    protected onInitialize(server: Server) {
         server.on('connection', client => {
-            this.log('on connection');
-            client.on(this.requestEvent, async (request: IRestRequest) => {
-                this.log('on request', request);
-                if (!this._services[request.service]) {
-                    this.respondError(client, request, `service '${request.service}' not found.`);
-                } else if (!this._services[request.service][request.method]) {
-                    this.respondError(client, request, `service '${request.service}' not contains method '${request.method}'.`);
-                } else if (!this.isDataValid(request, this._services[request.service][request.method].metadata.params)) {
-                    this.respondError(client, request, `invalid data`);
+            this.logger.log('on connection');
+            client.on(this.REQUEST_EVENT, async (req: IRestRequest) => {
+                this.logger.log('on request', req);
+                if (!this._services.exists(req.service, req.method)) {
+                    this.respondError(client, req, {
+                        code: WSErrorCode.ws_error,
+                        message: `service '${req.service}' or method '${req.method}' not found.`
+                    });
                 } else {
-                    const isValid = await this.isOptionsValid(client, this._services[request.service][request.method].options, request.credentials);
-                    if (!isValid) {
-                        this.respondError(client, request, `unauthorized`);
+                    const descriptor = this._services.get(req);
+                    const code = await this.isValid(
+                        client,
+                        descriptor.metadata.target,
+                        descriptor.options,
+                        req.credentials,
+                    );
+                    if (code != WSErrorCode.none) {
+                        this.respondError(client, req, {
+                            code,
+                            message: `unauthorized`,
+                        });
                     } else {
                         try {
-
-                            const target = this._services[request.service][request.method].metadata.target;
-                            const method = target[request.method];
-                            const params = this._services[request.service][request.method].metadata.params;
-                            const args = this.injectParams(client, request, params);
+                            const target = descriptor.metadata.target as any;
+                            const method = target[req.method];
+                            const params = descriptor.metadata.params;
+                            const args = this.injectParams(client, req, params);
 
                             let result: any = method.call(target, ...args);
                             if (this.isPromise(result)) {
                                 result = await result;
                             }
-                            this.respondSuccess(client, request, result);
+                            this.respondSuccess(client, req, result);
                         } catch (err) {
-                            this.respondError(client, request, err.message);
+                            this.respondError(client, req, {
+                                code: WSErrorCode.server_error,
+                                message: err.message,
+                            });
                         }
                     }
                 }
@@ -75,54 +69,50 @@ export class RestServer extends ServerBase {
         });
     }
 
-    register(instance: object) {
-        this.log(`register class ${instance.constructor.name}`);
+    register(instance: any) {
+        this.logger.log(`register class ${instance.constructor.name}`);
         this.getMethods(instance).forEach(propertyKey => {
-            const metadata: RestDecoratorOptions = Reflect.getMetadata(restDecoratorKey, instance, propertyKey);
-            if (metadata) {
-                const service = metadata.service;
-                const method = propertyKey;
-                const methodMetadata = this.getMethodMetadata(instance, method);
+            const options: RestDecoratorOptions = Reflect.getMetadata(restDecoratorKey, instance, propertyKey);
+            if (options) {
 
-                if (!this._services[service]) {
-                    this._services[service] = {};
+                const service = options.service
+                    ? options.service
+                    : this.extractServiceNameFromInstance(instance);
+
+                const method = propertyKey;
+                const metadata = this.getMethodMetadata(instance, method);
+
+                if (this._services.exists(service, method)) {
+                    throw new Error(`rest '${service}.${method}' already registered.`);
                 }
-                if (this._services[service][method]) {
-                    throw new Error(`service '${service}' already contains method '${method}'`);
-                }
-                this._services[service][method] = {
-                    options: metadata,
-                    metadata: methodMetadata,
-                };
+
+                this._services.add({ service, method, options, metadata });
             }
         });
+    }
+    registerMany(instances: any[]) {
+        instances.forEach(instance => this.register(instance));
     }
     //#endregion
 
     //#region [ message helpers ]
-    private respondError(client: SocketIO.Socket, request: IRestRequest, message: string) {
-        client.emit(this.requestResponse, {
+    private respondError(client: SocketIO.Socket, request: IRestRequest, error: IWSError) {
+        client.emit(this.RESPONSE_EVENT, {
             service: request.service,
             method: request.method,
             isSuccess: false,
-            error: message,
+            error,
         } as IRestResponse);
-        this.error(message);
+        this.logger.error(JSON.stringify(error));
     }
     private respondSuccess(client: SocketIO.Socket, request: IRestRequest, data: any) {
-        client.emit(this.requestResponse, {
+        client.emit(this.RESPONSE_EVENT, {
             service: request.service,
             method: request.method,
             isSuccess: true,
             data,
         } as IRestResponse);
-        this.log('success', data);
-    }
-    //#endregion
-
-    //#region [ validations ]
-    private isDataValid(data: any, params: IParamMetadata[]): boolean {
-        return true;
+        this.logger.log('success', data);
     }
     //#endregion
 

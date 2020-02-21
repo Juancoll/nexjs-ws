@@ -1,12 +1,15 @@
-import { IDecoratorOptionsBase } from '../IDecoratorOptionsBase';
+// tslint:disable:ban-types
+import { IDecoratorOptionsBase } from '../base/IDecoratorOptionsBase';
 
-export interface IHubDecoratorOptions extends IDecoratorOptionsBase {
-    selection?: (user: any, userCredentials: any, serverCredentials: any) => Promise<boolean>;
+export interface IHubDecoratorOptions<T = any> extends IDecoratorOptionsBase<T> {
+    selection?: (instance: T, user: any, userCredentials: any, serverCredentials: any) => Promise<boolean>;
 }
 
 export const hubDecoratorKey = 'custom:hub';
 
+type HubType = <T = any> (options?: IHubDecoratorOptions<T>) => (hubDecoratorKey: any, options: any) => void;
+
 // tslint:disable-next-line: variable-name
-export const Hub = (options: IHubDecoratorOptions) => {
-    return Reflect.metadata(hubDecoratorKey, options);
+export const Hub: HubType = (options) => {
+    return Reflect.metadata(hubDecoratorKey, !options ? {} : options);
 };
